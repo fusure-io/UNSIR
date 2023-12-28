@@ -12,6 +12,20 @@ class Noise(nn.Module):
     def forward(self):
         return self.noise
 
+class NoisyDataset(Dataset):
+    def __init__(self, noisy_data):
+        self.noisy_data = noisy_data
+
+    def __len__(self):
+        return len(self.noisy_data)
+
+    def __getitem__(self, idx):
+        input_data, label = self.noisy_data[idx]
+        input_data = input_data.view(3, 32, 32).to(torch.float32) 
+        result = { 'image':input_data, 
+                   'label':label
+                 }
+        return result
 
 class Unlearn():
     """
@@ -56,6 +70,7 @@ class Unlearn():
         self.dim=dim
         self.shape=shape
         self.batch_size=batch_size 
+        self.retain_loader = DataLoader(self.retain_set,batch_size=self.batch_size)
         
     def error_maximizing_noise(self) -> Dataset:
         """
@@ -76,9 +91,9 @@ class Unlearn():
         for cls in self.forget_classes:
             print("Optiming loss for class {}".format(cls))
             if dim ==3:
-                noises[cls] = Noise(batch_size, B, T, C).to(self.device)
+                noises[cls] = Noise(self.batch_size, B, T, C).to(self.device)
             else:
-                noises[cls] = Noise(batch_size, T, C).to(self.device)
+                noises[cls] = Noise(self.batch_size, T, C).to(self.device)
 
             opt = torch.optim.Adam(noises[cls].parameters(), lr = 0.1)
 
@@ -92,7 +107,7 @@ class Unlearn():
                 inputs = noises[cls]()
                 labels = torch.zeros(self.batch_size).to(self.device)+class_label
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
-                outputs = model(inputs)
+                outputs = self.model(inputs)
                 loss = -nn.functional.cross_entropy(outputs, labels.long())+ 0.1*torch.mean(torch.sum(torch.square(inputs), mean_dim))
                 opt.zero_grad()
                 loss.backward()
@@ -103,59 +118,104 @@ class Unlearn():
         noisy_data = []
         num_batches = 20
 
-        for cls in forget_classes:
-        for i in range(num_batches):
-            batch = noises[cls]().cpu().detach()
-            for i in range(batch[0].size(0)):
-                noisy_data.append((batch[i], cls))
+        for cls in self.forget_classes:
+            for i in range(num_batches):
+                batch = noises[cls]().cpu().detach()
+                for i in range(batch[0].size(0)):
+                    noisy_data.append((batch[i], cls))
 
         noisy_dataset = NoisyDataset(noisy_data)
 
         return noisy_dataset
 
-    def impair(self,impair_steps=1) -> torch.nn.Module:
+    def impair(self,impair_steps=1,learning_rate=0.1,momentum:float=0.9,weight_decay:float=5e-4) -> torch.nn.Module:
         """
         A single pass of the impair step.
 
         impair_steps: Integer. The number of timer the model trains on the noise and retain dataset
+        learning_rate: Float. The default is 0.1, 
+        momentum=momentum:Float. The default is 0.9, 
+        weight_decay:Float. The default is 5e-4
         """
-        noisy_dataset = self.
-        optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+        try:
+            noisy_dataset = self.error_maximizing_noise()
+            noisy_loader = DataLoader(noisy_dataset,batch_size=self.batch_size)
+            optimizer = optim.SGD(self.model.parameters(), lr=learning_rate, momentum=momentum, weight_decay=momentum)
 
-        for epoch in range(impair_steps):
-            self.model.train(True)  # Set the model to training mode
-            running_loss = 0.0
-            running_acc = 0
-            # Iterate over both noisy data and retain data loaders in an alternating fashion
-            for i, (noisy_data, retain_data) in enumerate(zip(noisy_loader, retain_loader)):
-                # Process noisy data
-                noisy_inputs = noisy_data["image"]
-                noisy_labels = noisy_data["age_group"]
-                noisy_inputs, noisy_labels = noisy_inputs.to(DEVICE), noisy_labels.to(DEVICE)
+            for epoch in range(impair_steps):
+                self.model.train(True)  # Set the model to training mode
+                running_loss = 0.0
+                running_acc = 0
+                # Iterate over both noisy data and retain data loaders in an alternating fashion
+                for i, (noisy_data, retain_data) in enumerate(zip(noisy_loader, self.retain_loader)):
+                    # Process noisy data
+                    noisy_inputs = noisy_data["image"]
+                    noisy_labels = noisy_data["label"]
+                    noisy_inputs, noisy_labels = noisy_inputs.to(self.device), noisy_labels.to(self.device)
 
-                optimizer.zero_grad()
-                noisy_outputs = model(noisy_inputs)
-                noisy_loss = nn.functional.cross_entropy(noisy_outputs, noisy_labels)
-                noisy_loss.backward()
-                optimizer.step()
+                    optimizer.zero_grad()
+                    noisy_outputs = self.model(noisy_inputs)
+                    noisy_loss = nn.functional.cross_entropy(noisy_outputs, noisy_labels)
+                    noisy_loss.backward()
+                    optimizer.step()
 
 
-                retain_inputs = retain_data["image"]
-                retain_labels = retain_data["age_group"]
-                retain_inputs, retain_labels = retain_inputs.to(DEVICE), retain_labels.to(DEVICE)
+                    retain_inputs = retain_data["image"]
+                    retain_labels = retain_data["label"]
+                    retain_inputs, retain_labels = retain_inputs.to(self.device), retain_labels.to(self.device)
 
-                optimizer.zero_grad()
-                retain_outputs = model(retain_inputs)
-                retain_loss = nn.functional.cross_entropy(retain_outputs, retain_labels)
-                retain_loss.backward()
-                optimizer.step()
+                    optimizer.zero_grad()
+                    retain_outputs = self.model(retain_inputs)
+                    retain_loss = nn.functional.cross_entropy(retain_outputs, retain_labels)
+                    retain_loss.backward()
+                    optimizer.step()
 
-                combined_loss = noisy_loss + retain_loss
-                running_loss += combined_loss.item()
-                out = torch.argmax(noisy_outputs.detach(), dim=1)
-                assert out.shape == noisy_labels.shape
-                running_acc += (noisy_labels == out).sum().item()
+                    combined_loss = noisy_loss + retain_loss
+                    running_loss += combined_loss.item()
+                    out = torch.argmax(noisy_outputs.detach(), dim=1)
+                    assert out.shape == noisy_labels.shape
+                    running_acc += (noisy_labels == out).sum().item()
 
-            # Print statistics for the epoch
-            return model
+                # Print statistics for the epoch
+                print("Successfully ran the Impair Step")
+                return "Success"
+        except Exception as e:
+            print(str(e))
+            return e
 
+    def repair(self,
+               repair_steps=1
+               learning_rate:float=0.1, 
+               momentum:float=0.9,
+               weight_decay:float=5e-4):
+        """
+        A single pass of the repair step.
+
+        repair_steps: Integer. The number of timer the model trains on the retain dataset
+        learning_rate: Float. The default is 0.1, 
+        momentum=momentum:Float. The default is 0.9, 
+        weight_decay:Float. The default is 5e-4
+        """
+        try:
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+            self.model.train()
+
+            for _ in range(repair_steps):
+                for sample in self.retain_loader:
+                    inputs = sample["image"]
+                    targets = sample["age_group"]
+                    inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+                    optimizer.zero_grad()
+                    outputs = self.model(inputs)
+                    loss = criterion(outputs, targets)
+                    loss.backward()
+                    optimizer.step()
+                scheduler.step()
+            print("Successfully ran the Impair Step")
+            return "Success"
+        except Exception as e:
+            print(str(e))
+            return str(e)
